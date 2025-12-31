@@ -1,12 +1,14 @@
-// === index.js（完整覆蓋版｜常駐語音 A 版｜Gemini TTS→語音播放｜Render Worker）===
-// ✅ 特點
-// - 啟動後立刻 join 指定語音頻道，並「常駐不離開」(A：最穩)
-// - 斷線/abort 自動重連（無限重試 + 退避）
-// - Gemini TTS 回傳格式做兼容解析（避免 missing inlineData.data）
-// - 播放需要 Opus encoder：支援 opusscript（推薦）或 @discordjs/opus
-// - 全面 error guard，避免 Render crash loop
+// === index.js（完整覆蓋版｜Render 穩定版｜常駐語音｜Gemini TTS｜防 IP discovery 崩潰）===
+// ✅ 本版解決：
+// 1) Render 偶發 "No open HTTP ports detected" → 加一個超小 HTTP server (health)
+// 2) Voice UDP / IP discovery 不穩 → 偵測錯誤直接 destroy + 退避重連（不會卡半死）
+// 3) 連線互斥：避免 message 觸發重複 join
+// 4) Gemini TTS 偶爾回 parts=0 (finishReason OTHER) → 自動重試 + 文字修正提示 + 最後降級到「直接略過」不讓整體卡死
+// 5) Opus encoder 支援 opusscript（推薦）/ @discordjs/opus / node-opus
+// 6) 全面 error guard，避免 Render crash loop
 
 import "dotenv/config";
+import http from "http";
 import { Client, GatewayIntentBits, Partials } from "discord.js";
 import {
   joinVoiceChannel,
@@ -20,11 +22,21 @@ import {
 } from "@discordjs/voice";
 import fetch from "node-fetch";
 import { spawn } from "node:child_process";
-import { Readable } from "node:stream";
 import ffmpegPath from "ffmpeg-static";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
+
+/* =========================
+   HTTP Health Server (Render friendly)
+========================= */
+const PORT = process.env.PORT || 10000;
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("OK");
+  })
+  .listen(PORT, () => console.log("🌐 HTTP server listening on", PORT));
 
 /* =========================
    ENV
@@ -38,7 +50,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_TTS_MODEL = process.env.GEMINI_TTS_MODEL || "gemini-2.5-flash-preview-tts";
 const GEMINI_VOICE_NAME = process.env.GEMINI_VOICE_NAME || "Kore";
 
-// 你想要的冷卻/摘要/人格：先留好開關（下一步我們再加）
+// 之後要加的功能先預留
 const COOLDOWN_MS = Number(process.env.COOLDOWN_MS || 0); // 例如 3000
 const LONG_TEXT_THRESHOLD = Number(process.env.LONG_TEXT_THRESHOLD || 0); // 例如 120
 
@@ -57,7 +69,6 @@ function hasOpusEncoder() {
   } catch {}
   return null;
 }
-
 const opusImpl = hasOpusEncoder();
 
 console.log("BOOT env check:", {
@@ -78,11 +89,10 @@ if (!GUILD_ID) missing.push("GUILD_ID");
 if (!TEXT_CHANNEL_ID) missing.push("TEXT_CHANNEL_ID");
 if (!VOICE_CHANNEL_ID) missing.push("VOICE_CHANNEL_ID");
 if (!GEMINI_API_KEY) missing.push("GEMINI_API_KEY");
-if (!ffmpegPath) missing.push("ffmpeg-static (dependency)");
+if (!ffmpegPath) missing.push("ffmpeg-static");
 if (!opusImpl) missing.push("opus encoder (install opusscript recommended)");
 if (missing.length) {
   console.error("❌ Missing ENV / dependency:", missing.join(", "));
-  console.error("👉 建議：npm i opusscript  （Windows/Render 都最穩）");
   process.exit(1);
 }
 
@@ -103,23 +113,23 @@ const client = new Client({
    Voice State
 ========================= */
 let voiceConnection = null;
-let connectingPromise = null;
+let connectLock = null; // 互斥：同一時間只允許一次 connect loop
+let lastVoiceErrorAt = 0;
 
 let player = null;
-
-// 播放佇列（避免連續訊息把播放器打爆）
 const queue = [];
 let speaking = false;
 
-// 冷卻（可選）
-const lastSpeak = new Map(); // userId -> ts
+const lastSpeak = new Map(); // userId -> ts (cooldown)
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
 function getOrCreatePlayer(conn) {
   if (!player) {
     player = createAudioPlayer();
-    player.on("error", (err) => {
-      console.error("🔴 AudioPlayer error:", err?.message || err);
-    });
+    player.on("error", (err) => console.error("🔴 AudioPlayer error:", err?.message || err));
     player.on(AudioPlayerStatus.Playing, () => console.log("▶️ playing"));
     player.on(AudioPlayerStatus.Idle, () => console.log("⏹️ idle"));
   }
@@ -131,8 +141,24 @@ function getOrCreatePlayer(conn) {
   return player;
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+function destroyVoice(reason = "destroy") {
+  try {
+    if (voiceConnection) {
+      console.warn("🧨 destroy voice connection:", reason);
+      voiceConnection.destroy();
+    }
+  } catch {}
+  voiceConnection = null;
+}
+
+function shouldDestroyOnErrorMessage(msg) {
+  const s = String(msg || "");
+  return (
+    s.includes("Cannot perform IP discovery") ||
+    s.includes("socket closed") ||
+    s.includes("The operation was aborted") ||
+    s.includes("VOICE_CONNECTION") // 泛用
+  );
 }
 
 async function connectVoiceOnce(guild) {
@@ -150,37 +176,39 @@ async function connectVoiceOnce(guild) {
     channelId: voiceChannel.id,
     guildId: guild.id,
     adapterCreator: guild.voiceAdapterCreator,
-    selfDeaf: false,
+    // ✅ Render/雲端常見更穩：自我靜音（不影響說話）
+    selfDeaf: true,
     selfMute: false,
   });
 
   conn.on("error", (err) => {
-    console.error("🔴 VoiceConnection error:", err?.message || err);
+    const msg = err?.message || String(err);
+    console.error("🔴 VoiceConnection error:", msg);
+    lastVoiceErrorAt = Date.now();
+    // ✅ IP discovery 相關：立刻 destroy 讓 loop 重建
+    if (shouldDestroyOnErrorMessage(msg)) destroyVoice("ip-discovery/error");
   });
 
   conn.on(VoiceConnectionStatus.Disconnected, () => {
-    console.warn("🟠 Voice disconnected (will reconnect loop).");
-    // 讓 connect loop 重新建立
-    try { conn.destroy(); } catch {}
-    voiceConnection = null;
+    console.warn("🟠 Voice disconnected (will reconnect).");
+    destroyVoice("disconnected");
   });
 
-  // 等待 Ready
-  await entersState(conn, VoiceConnectionStatus.Ready, 30_000);
+  await entersState(conn, VoiceConnectionStatus.Ready, 35_000);
   voiceConnection = conn;
   getOrCreatePlayer(conn);
-
-  console.log("🎧 Voice ready (resident).");
+  console.log("🎧 Voice ready (stable resident).");
   return conn;
 }
 
-// 常駐重連：無限重試 + 退避
+// ✅ 常駐重連：互斥 + 無限重試 + 退避
 async function ensureResidentVoice(guild) {
-  if (connectingPromise) return connectingPromise;
+  if (voiceConnection) return voiceConnection;
+  if (connectLock) return connectLock;
 
-  connectingPromise = (async () => {
+  connectLock = (async () => {
     let attempt = 0;
-    while (true) {
+    while (!voiceConnection) {
       attempt += 1;
       try {
         console.log(`🔌 voice connect attempt ${attempt}...`);
@@ -189,24 +217,25 @@ async function ensureResidentVoice(guild) {
       } catch (e) {
         const msg = e?.message || String(e);
         console.error("🔴 ensureResidentVoice failed:", msg);
-        voiceConnection = null;
-        // 退避：1s,2s,4s,...最多 15s
+        destroyVoice("connect-failed");
+
+        // 退避：1s,2s,4s,8s,15s...
         const backoff = Math.min(15000, 1000 * Math.pow(2, Math.min(4, attempt - 1)));
         await sleep(backoff);
       }
     }
+    return voiceConnection;
   })();
 
   try {
-    return await connectingPromise;
+    return await connectLock;
   } finally {
-    // 如果成功/失敗返回後清掉（成功會 return；失敗會在 loop 內重試）
-    connectingPromise = null;
+    connectLock = null;
   }
 }
 
 /* =========================
-   Gemini TTS (compat parser)
+   Gemini TTS (retry + compat parser)
 ========================= */
 async function geminiGenerateTtsAudioBase64(text) {
   const safe = String(text || "").trim().slice(0, 500);
@@ -221,21 +250,14 @@ async function geminiGenerateTtsAudioBase64(text) {
     generationConfig: {
       responseModalities: ["AUDIO"],
       speechConfig: {
-        voiceConfig: {
-          prebuiltVoiceConfig: { voiceName: GEMINI_VOICE_NAME },
-        },
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: GEMINI_VOICE_NAME } },
       },
     },
   };
 
-  console.log("🔊 TTS request:", { len: safe.length });
-
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": GEMINI_API_KEY,
-    },
+    headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
     body: JSON.stringify(body),
   });
 
@@ -245,7 +267,6 @@ async function geminiGenerateTtsAudioBase64(text) {
     throw new Error(msg);
   }
 
-  // 兼容掃描：parts[].inlineData.data / parts[].inline_data.data
   const cand0 = json?.candidates?.[0];
   const parts = cand0?.content?.parts || [];
   for (const p of parts) {
@@ -257,7 +278,6 @@ async function geminiGenerateTtsAudioBase64(text) {
     }
   }
 
-  // 找不到就印出 debug（不要整包 json，太大）
   console.error("🔎 Gemini TTS response debug:", {
     candidates: Array.isArray(json?.candidates) ? json.candidates.length : 0,
     partCount: parts.length,
@@ -269,13 +289,28 @@ async function geminiGenerateTtsAudioBase64(text) {
 }
 
 async function geminiTtsPcm24kMono(text) {
-  const { b64 } = await geminiGenerateTtsAudioBase64(text);
-  return Buffer.from(b64, "base64"); // PCM s16le, 24000Hz, mono（依官方範例）
+  // ✅ 自動重試 + 文字修正提示
+  const tries = [
+    text,
+    `請用語音輸出以下內容，不要回覆文字或其他格式：${text}`,
+  ];
+
+  let lastErr = null;
+  for (let i = 0; i < tries.length; i++) {
+    try {
+      console.log("🔊 TTS request:", { len: String(tries[i]).length, pass: i + 1 });
+      const { b64 } = await geminiGenerateTtsAudioBase64(tries[i]);
+      return Buffer.from(b64, "base64");
+    } catch (e) {
+      lastErr = e;
+      // 短暫等一下再試
+      await sleep(500);
+    }
+  }
+  throw lastErr || new Error("Gemini TTS failed");
 }
 
 function pcm24kMonoToDiscordRawStream(pcmBuf) {
-  // Discord 的 StreamType.Raw 預設期待：s16le 48000Hz stereo
-  // 用 ffmpeg 做 resample + upmix
   const ff = spawn(ffmpegPath, [
     "-hide_banner",
     "-loglevel",
@@ -353,6 +388,12 @@ async function speak(guild, text) {
       });
     } catch (e) {
       console.error("❌ speak error:", e?.message || e);
+
+      // ✅ 如果 voice error 很新鮮（剛爆），就讓連線重建一次再繼續
+      if (Date.now() - lastVoiceErrorAt < 10_000) {
+        destroyVoice("recent-voice-error");
+        await sleep(1200);
+      }
     }
   }
   speaking = false;
@@ -367,10 +408,9 @@ client.once("ready", async () => {
 
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
-    // A：常駐語音，啟動就連
     await ensureResidentVoice(guild);
 
-    // 心跳：每 25 秒確認一次連線（被動斷線時補上）
+    // 心跳：每 20 秒確認一次，若被 destroy 就重建
     setInterval(async () => {
       try {
         const g = client.guilds.cache.get(GUILD_ID) || (await client.guilds.fetch(GUILD_ID));
@@ -378,7 +418,7 @@ client.once("ready", async () => {
       } catch (e) {
         console.error("heartbeat ensure voice error:", e?.message || e);
       }
-    }, 25_000);
+    }, 20_000);
   } catch (e) {
     console.error("ready() ensure voice failed:", e?.message || e);
   }
@@ -401,7 +441,7 @@ client.on("messageCreate", async (msg) => {
       lastSpeak.set(msg.author.id, now);
     }
 
-    // 長文摘要（可選，下一步我們會接 LLM 摘要；先直接截短避免燒）
+    // 長文先保底截斷（下一步再接摘要 LLM）
     let say = text;
     if (LONG_TEXT_THRESHOLD > 0 && say.length > LONG_TEXT_THRESHOLD) {
       say = say.slice(0, LONG_TEXT_THRESHOLD) + "…";
@@ -414,11 +454,7 @@ client.on("messageCreate", async (msg) => {
   }
 });
 
-process.on("unhandledRejection", (reason) => {
-  console.error("🔴 unhandledRejection:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("🔴 uncaughtException:", err);
-});
+process.on("unhandledRejection", (reason) => console.error("🔴 unhandledRejection:", reason));
+process.on("uncaughtException", (err) => console.error("🔴 uncaughtException:", err));
 
 client.login(TOKEN);
